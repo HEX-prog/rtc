@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>Ultra-Low Latency Alıcı</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+        }
+
+        /* ─── Video tam arka plan ─── */
+        #remote-video {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            background: #000;
+            image-rendering: pixelated;
+            object-fit: none; /* default: orijinal boyut */
+        }
+        #remote-video.mode-center-crop { object-fit: cover;   object-position: center; }
+        #remote-video.mode-fit         { object-fit: contain; object-position: center; }
+
+        /* ─── HUD (overlay) ─── */
+        #hud {
+            position: fixed;
+            top: 0; left: 0;
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 12px;
+            pointer-events: none;
+        }
+
+        #id-badge {
+            pointer-events: all;
+            background: rgba(0,0,0,0.75);
+            border: 1px solid #1e1e1e;
+            border-radius: 3px;
+            padding: 6px 12px;
+            font-size: 11px;
+            letter-spacing: 0.12em;
+            color: #555;
+        }
+        #id-badge span {
+            color: #00bc70;
+            user-select: all;
+            cursor: text;
+        }
+
+        #stats-bar {
+            display: flex;
+            gap: 6px;
+        }
+        .stat {
+            background: rgba(0,0,0,0.75);
+            border: 1px solid #1a1a1a;
+            border-radius: 3px;
+            padding: 5px 10px;
+            text-align: center;
+            min-width: 64px;
+        }
+        .stat-val {
+            font-size: 16px;
+            font-weight: 700;
+            color: #00bc70;
+            line-height: 1;
+        }
+        .stat-val.warn { color: #f0a000; }
+        .stat-val.bad  { color: #e04040; }
+        .stat-lbl {
+            font-size: 8px;
+            letter-spacing: 0.12em;
+            color: #444;
+            text-transform: uppercase;
+            margin-top: 3px;
+        }
+
+        /* ─── Sağ üst kontroller ─── */
+        #controls {
+            position: fixed;
+            top: 12px; right: 12px;
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            align-items: flex-end;
+        }
+        button {
+            padding: 7px 14px;
+            background: rgba(0,0,0,0.75);
+            color: #aaa;
+            border: 1px solid #2a2a2a;
+            border-radius: 3px;
+            cursor: pointer;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            transition: border-color 0.15s, color 0.15s;
+        }
+        button:hover { border-color: #00bc70; color: #00bc70; }
+
+        /* ─── Bağlantı bekleme ekranı ─── */
+        #waiting {
+            position: fixed;
+            inset: 0;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #080808;
+            gap: 12px;
+            transition: opacity 0.4s;
+        }
+        #waiting.hidden { opacity: 0; pointer-events: none; }
+        #waiting-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #00bc70;
+            animation: pulse 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { opacity: 0.2; transform: scale(1); }
+            50%      { opacity: 1;   transform: scale(1.4); }
+        }
+        #waiting p {
+            font-size: 11px;
+            letter-spacing: 0.2em;
+            color: #333;
+            text-transform: uppercase;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Bekleme ekranı -->
+<div id="waiting">
+    <div id="waiting-dot"></div>
+    <p>Bağlantı bekleniyor…</p>
+</div>
+
+<!-- Video -->
+<video id="remote-video" autoplay playsinline muted disableRemotePlayback></video>
+
+<!-- HUD -->
+<div id="hud">
+    <div id="id-badge">ID: <span id="my-id">—</span></div>
+    <div id="stats-bar">
+        <div class="stat"><div class="stat-val" id="s-fps">—</div><div class="stat-lbl">FPS</div></div>
+        <div class="stat"><div class="stat-val" id="s-rtt">—</div><div class="stat-lbl">RTT ms</div></div>
+        <div class="stat"><div class="stat-val" id="s-jit">—</div><div class="stat-lbl">Jitter ms</div></div>
+        <div class="stat"><div class="stat-val" id="s-lost">—</div><div class="stat-lbl">Lost</div></div>
+        <div class="stat"><div class="stat-val" id="s-buf">—</div><div class="stat-lbl">Buf ms</div></div>
+    </div>
+</div>
+
+<!-- Kontroller -->
+<div id="controls">
+    <button id="mode-btn" onclick="toggleMode()">Mod: Orijinal</button>
+    <button onclick="toggleHud()">HUD Gizle/Göster</button>
+</div>
+
+<script>
+// ─── UI ────────────────────────────────────────────────────────────────────
+const video    = document.getElementById('remote-video');
+const waiting  = document.getElementById('waiting');
+const modeBtn  = document.getElementById('mode-btn');
+
+const sFps  = document.getElementById('s-fps');
+const sRtt  = document.getElementById('s-rtt');
+const sJit  = document.getElementById('s-jit');
+const sLost = document.getElementById('s-lost');
+const sBuf  = document.getElementById('s-buf');
+
+let currentMode = 0;
+const modes = [
+    { cls: '',                  txt: 'Mod: Orijinal' },
+    { cls: 'mode-center-crop',  txt: 'Mod: Center Crop' },
+    { cls: 'mode-fit',          txt: 'Mod: Fit' },
+];
+function toggleMode() {
+    video.classList.remove(modes[currentMode].cls);
+    currentMode = (currentMode + 1) % modes.length;
+    video.classList.add(modes[currentMode].cls);
+    modeBtn.textContent = modes[currentMode].txt;
+}
+
+let hudVisible = true;
+function toggleHud() {
+    hudVisible = !hudVisible;
+    document.getElementById('hud').style.opacity = hudVisible ? '1' : '0';
+}
+
+// ─── PeerJS ────────────────────────────────────────────────────────────────
+const peer = new Peer({
+    config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+});
+
+peer.on('open', id => {
+    document.getElementById('my-id').textContent = id;
+});
+
+peer.on('call', call => {
+    call.answer();
+
+    call.on('stream', remoteStream => {
+        // ── 1. Stream'i hemen bağla, play() tetikle ──
+        video.srcObject = remoteStream;
+
+        // ── 2. Jitter buffer sıfırla (en kritik alıcı optimizasyonu) ──
+        applyReceiverOptimizations(call);
+
+        // ── 3. Video hazır olur olmaz oluşabilecek en erken play() ──
+        const tryPlay = () => {
+            video.play().catch(() => {});
+        };
+        // readyState >= 1 (HAVE_METADATA) → yeterli, beklemeden başlat
+        if (video.readyState >= 1) {
+            tryPlay();
+        } else {
+            video.addEventListener('loadedmetadata', tryPlay, { once: true });
+        }
+
+        // ── 4. Bekleme ekranını kaldır ──
+        waiting.classList.add('hidden');
+
+        // ── 5. İstatistikleri başlat ──
+        startStats(call);
+        startFrameStats();
+    });
+});
+
+// ─── Alıcı Optimizasyonları ────────────────────────────────────────────────
+function applyReceiverOptimizations(call) {
+    // PeerJS 1.5.x iç RTCPeerConnection referansı
+    const pc = call.peerConnection || call._pc;
+    if (!pc) return;
+
+    // Receiver'lar hemen hazır olmayabilir, polling ile zorla
+    function forceZeroBuffer() {
+        const receivers = pc.getReceivers();
+        let applied = false;
+        receivers.forEach(receiver => {
+            if (!receiver.track || receiver.track.kind !== 'video') return;
+            applied = true;
+
+            // jitterBufferTarget: Chromium M112+ — 0 = buffer yok, anında ilet
+            if ('jitterBufferTarget' in receiver) {
+                receiver.jitterBufferTarget = 0;
+            }
+            // jitterBufferDelayHint: standart API
+            if ('jitterBufferDelayHint' in receiver) {
+                receiver.jitterBufferDelayHint = 0;
+            }
+        });
+        return applied;
+    }
+
+    // İlk deneme
+    if (!forceZeroBuffer()) {
+        // Track henüz gelmemişse kısa aralıklarla tekrar dene
+        let attempts = 0;
+        const retry = setInterval(() => {
+            if (forceZeroBuffer() || ++attempts > 20) clearInterval(retry);
+        }, 100);
+    }
+
+    // Bağlantı kararlı olduktan sonra bir kez daha uygula (race condition önlemi)
+    pc.addEventListener('connectionstatechange', () => {
+        if (pc.connectionState === 'connected') forceZeroBuffer();
+    });
+
+    // ── Video element latency ipuçları ──
+    video.playsInline = true;
+
+    // Chromium: HTMLMediaElement.latencyHint (non-standard, varsa kullan)
+    if ('latencyHint' in video) video.latencyHint = 'interactive';
+
+    // preservesPitch: false → pitch düzeltmesi için extra buffer tutulmasın
+    if ('preservesPitch' in video) video.preservesPitch = false;
+
+    // disableRemotePlayback → cast/airplay overhead'ini kaldır (HTML attribute ile zaten set edildi)
+    video.disableRemotePlayback = true;
+}
+
+// ─── Frame Zamanlama (requestVideoFrameCallback) ───────────────────────────
+let lastPresentTime = 0;
+let frameCount = 0;
+let fpsTimer = performance.now();
+
+function startFrameStats() {
+    if (!('requestVideoFrameCallback' in video)) {
+        // Fallback: rAF ile FPS tahmin et
+        const rAFfps = () => {
+            frameCount++;
+            const now = performance.now();
+            if (now - fpsTimer >= 500) {
+                sFps.textContent = Math.round(frameCount / (now - fpsTimer) * 1000);
+                frameCount = 0;
+                fpsTimer = now;
+            }
+            requestAnimationFrame(rAFfps);
+        };
+        requestAnimationFrame(rAFfps);
+        return;
+    }
+
+    // requestVideoFrameCallback: gerçek decode→display süresi
+    // metadata.expectedDisplayTime - metadata.mediaTime farkı gerçek pipeline gecikmesini verir
+    const onFrame = (now, metadata) => {
+        frameCount++;
+
+        // Gerçek frame işleme süresi
+        if (lastPresentTime > 0) {
+            const delta = metadata.presentationTime - lastPresentTime;
+            // delta ~ 16.6ms ise 60fps, iyi
+        }
+        lastPresentTime = metadata.presentationTime;
+
+        // FPS hesabı
+        const elapsed = now - fpsTimer;
+        if (elapsed >= 500) {
+            const fps = Math.round(frameCount / elapsed * 1000);
+            sFps.textContent = fps;
+            sFps.className = 'stat-val' + (fps < 30 ? ' bad' : fps < 50 ? ' warn' : '');
+            frameCount = 0;
+            fpsTimer = now;
+        }
+
+        video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+}
+
+// ─── WebRTC Stats ──────────────────────────────────────────────────────────
+function startStats(call) {
+    const pc = call.peerConnection || call._pc;
+    if (!pc) return;
+
+    setInterval(async () => {
+        try {
+            const stats = await pc.getStats();
+            stats.forEach(r => {
+                // RTT
+                if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+                    const rtt = r.currentRoundTripTime;
+                    if (rtt != null) {
+                        const ms = (rtt * 1000).toFixed(1);
+                        sRtt.textContent = ms;
+                        sRtt.className = 'stat-val' + (ms > 20 ? ' bad' : ms > 10 ? ' warn' : '');
+                    }
+                }
+                // Jitter, kayıp paket, jitter buffer
+                if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                    // Jitter
+                    if (r.jitter != null) {
+                        const jMs = (r.jitter * 1000).toFixed(1);
+                        sJit.textContent = jMs;
+                        sJit.className = 'stat-val' + (jMs > 5 ? ' bad' : jMs > 2 ? ' warn' : '');
+                    }
+                    // Kayıp paket
+                    if (r.packetsLost != null) {
+                        sLost.textContent = r.packetsLost;
+                        sLost.className = 'stat-val' + (r.packetsLost > 10 ? ' bad' : r.packetsLost > 0 ? ' warn' : '');
+                    }
+                    // Jitter buffer gecikme tahmini
+                    if (r.jitterBufferDelay != null && r.jitterBufferEmittedCount != null && r.jitterBufferEmittedCount > 0) {
+                        const bufMs = ((r.jitterBufferDelay / r.jitterBufferEmittedCount) * 1000).toFixed(1);
+                        sBuf.textContent = bufMs;
+                        sBuf.className = 'stat-val' + (bufMs > 10 ? ' bad' : bufMs > 5 ? ' warn' : '');
+                    }
+                }
+            });
+        } catch (_) {}
+    }, 1000);
+}
+</script>
+</body>
+</html>
