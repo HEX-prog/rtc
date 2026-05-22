@@ -4,6 +4,8 @@ import mss
 import cv2
 import dxcam
 from config import config
+import threading
+import queue
 
 # NDI imports
 from cyndilib.wrapper.ndi_recv import RecvColorFormat, RecvBandwidth
@@ -225,8 +227,7 @@ class NDICamera:
                 # keep whatever we had, but make sure it's a list
                 self.available_sources = self.available_sources or []
         return list(self.available_sources)
-    
-    
+     
     def maintain_connection(self):
         
         if self.connected and not self.receiver.is_connected():
@@ -270,9 +271,6 @@ class NDICamera:
             self.finder.close()
         except Exception as e:
             print(f"[NDI] stop() error: {e}")
-
-
-
 
 
 class DXGICamera:
@@ -548,6 +546,164 @@ class UDPCamera:
                 self.udp_receiver = None
 
 
+class WebRTCCamera:
+    """
+    WebRTC camera for receiving ultra-low-latency video streams via PeerJS.
+    Optimized for minimum latency with configurable jitter buffer settings.
+    """
+    def __init__(self, region=None):
+        """
+        Initialize WebRTC camera receiver.
+        
+        Args:
+            region: Optional region tuple for cropping (not typically used for WebRTC)
+        """
+        self.region = region
+        self.running = True
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.last_valid_frame = None
+        self.peer_id = None
+        self.connection_established = False
+        self.last_frame_time = 0
+        self.frame_count = 0
+        self.last_fps_update = 0
+        self.current_fps = 0
+        self.current_delay_ms = 0
+        
+        # WebRTC stream dimensions
+        self.width = int(getattr(config, "webrtc_width", 1280))
+        self.height = int(getattr(config, "webrtc_height", 720))
+        self.target_fps = int(getattr(config, "webrtc_fps", 60))
+        
+        # Latency tracking for FPS and delay measurement
+        self.frame_timestamps = []
+        self.max_timestamp_history = 30
+        
+        print("[WebRTC] Camera initialized - waiting for connection")
+        print(f"[WebRTC] Expected resolution: {self.width}x{self.height} @ {self.target_fps}fps")
+
+    def set_peer_id(self, peer_id):
+        """Set the peer ID when connection is established"""
+        self.peer_id = peer_id
+        config.webrtc_peer_id = peer_id
+        print(f"[WebRTC] Peer ID set: {peer_id}")
+
+    def set_connection_status(self, connected):
+        """Update connection status"""
+        self.connection_established = connected
+        if connected:
+            print("[WebRTC] Connection established")
+        else:
+            print("[WebRTC] Connection lost")
+
+    def push_frame(self, frame_data):
+        """
+        Push a received frame to the internal queue.
+        Called by the frontend via IPC/API.
+        
+        Args:
+            frame_data: numpy array or bytes representing the frame
+        """
+        try:
+            # Track frame timestamp for FPS calculation
+            current_time = time.perf_counter()
+            self.frame_timestamps.append(current_time)
+            
+            # Keep only recent timestamps for FPS calculation
+            if len(self.frame_timestamps) > self.max_timestamp_history:
+                self.frame_timestamps.pop(0)
+            
+            # Calculate FPS based on frame interval
+            if len(self.frame_timestamps) > 1:
+                time_diff = self.frame_timestamps[-1] - self.frame_timestamps[0]
+                if time_diff > 0:
+                    self.current_fps = (len(self.frame_timestamps) - 1) / time_diff
+            
+            # Try to push frame without blocking (drop old frames if queue full)
+            try:
+                self.frame_queue.put(frame_data, block=False)
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.frame_queue.put(frame_data, block=False)
+                except queue.Full:
+                    pass
+            
+            self.last_frame_time = current_time
+            self.frame_count += 1
+            
+        except Exception as e:
+            print(f"[WebRTC] Error pushing frame: {e}")
+
+    def get_latest_frame(self):
+        """
+        Get the latest frame from the queue.
+        
+        Returns:
+            numpy.ndarray or None: Latest frame or None if no frame available
+        """
+        try:
+            # Non-blocking get with timeout
+            frame = self.frame_queue.get(timeout=0.01)
+            
+            if frame is None:
+                return self.last_valid_frame
+            
+            # If frame is bytes, decode it
+            if isinstance(frame, bytes):
+                nparr = np.frombuffer(frame, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            # Validate and cache frame
+            if frame is not None and len(frame.shape) == 3:
+                self.last_valid_frame = frame.copy()
+                config.webrtc_width = frame.shape[1]
+                config.webrtc_height = frame.shape[0]
+                return frame
+            
+            return self.last_valid_frame
+            
+        except queue.Empty:
+            return self.last_valid_frame
+        except Exception as e:
+            print(f"[WebRTC] Error getting frame: {e}")
+            return self.last_valid_frame
+
+    def get_fps(self):
+        """Get current FPS of incoming stream"""
+        return int(self.current_fps)
+
+    def get_delay_ms(self):
+        """Get estimated delay in milliseconds"""
+        # Estimate delay based on frame interval
+        if self.current_fps > 0:
+            frame_interval_ms = 1000.0 / self.current_fps
+            return int(frame_interval_ms)
+        return 0
+
+    def get_stats(self):
+        """Get stream statistics"""
+        return {
+            'peer_id': self.peer_id,
+            'connected': self.connection_established,
+            'fps': int(self.current_fps),
+            'delay_ms': self.get_delay_ms(),
+            'width': config.webrtc_width,
+            'height': config.webrtc_height,
+            'frame_count': self.frame_count,
+            'last_frame_time': self.last_frame_time
+        }
+
+    def stop(self):
+        """Stop WebRTC camera"""
+        self.running = False
+        self.connection_established = False
+        print("[WebRTC] Camera stopped")
+
+
 def get_camera():
     """Factory function to return the right camera based on config."""
     if config.capturer_mode.lower() == "mss":
@@ -568,6 +724,10 @@ def get_camera():
     elif config.capturer_mode.lower() == "udp":
         # For UDP mode, get full frame like NDI (no region cropping)
         cam = UDPCamera(None)
+        return cam, None
+    elif config.capturer_mode.lower() == "webrtc":
+        # For WebRTC mode, get full frame with ultra-low latency
+        cam = WebRTCCamera(None)
         return cam, None
     else:
         raise ValueError(f"Unknown capturer_mode: {config.capturer_mode}")
